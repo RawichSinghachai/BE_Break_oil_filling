@@ -5,13 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "aiomqtt>=2.5.1",
     "fastapi>=0.161.1",
     "ipykernel>=7.4.0",
     "matplotlib>=3.11.2",
+    "paho-mqtt>=2.1.0",
     "pandas>=3.0.6",
+    "psycopg[binary,pool]>=3.3.6",
     "scikit-learn>=1.9.1",
     "torch>=2.14.1",
-    "uvicorn>=0.54.0",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]

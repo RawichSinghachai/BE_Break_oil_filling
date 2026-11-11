@@ -74,6 +74,7 @@ def run_prediction(df_cycle):
         recon = model(x, mask).cpu().numpy()[0]            # [T,F] normalized
     raw_rec = _inv(recon)                                  # หน่วยจริง
     bn = int(df_cycle.sort_values("id")["lh_bn"].iloc[-1])
+    asn = int(df_cycle.sort_values("id")["lh_asn"].iloc[-1]) 
     T = int(raw_in.shape[0])
 
     # 2+3: % และ pass เฉพาะ feature ที่ตรวจ
@@ -93,6 +94,7 @@ def run_prediction(df_cycle):
 
     return {
         "bn": bn,
+        "asn": asn,
         "length": T,
         "overall_pass": all(f["pass"] for f in features.values()),   # 3
         "features": features,                                          # 2 + 3
