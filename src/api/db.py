@@ -8,10 +8,10 @@ from psycopg.rows import dict_row
 
 # ---- ตั้งค่าการเชื่อมต่อ (Postgres บนเครื่อง Windows ผ่าน Tailscale) ----
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
+    "host": os.getenv("DB_HOST", "100.117.187.28"),
     "port": int(os.getenv("DB_PORT", "5432")),
     "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "password": os.getenv("DB_PASSWORD", "1234@abcd"),
     "dbname": os.getenv("DB_NAME", "postgres"),
 }
 
