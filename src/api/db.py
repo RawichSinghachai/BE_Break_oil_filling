@@ -12,7 +12,7 @@ DB_CONFIG = {
     "host": os.getenv("DB_HOST", "100.117.187.28"),
     "port": int(os.getenv("DB_PORT", "5432")),
     "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "1234@abcd"),
+    "password": os.getenv("DB_PASSWORD"),   # ไม่มีค่า default: ตั้งผ่าน env DB_PASSWORD (หรือใช้ DATABASE_URL) ห้ามเขียนรหัสผ่านลงโค้ด
     "dbname": os.getenv("DB_NAME", "postgres"),
 }
 

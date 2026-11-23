@@ -5,6 +5,7 @@
          python test_db.py ABC123         # ส่ง target ผ่าน command line
 """
 
+import os
 import sys
 
 import psycopg
@@ -16,7 +17,7 @@ DB_CONFIG = {
     "host": "100.117.187.28",
     "port": 5432,
     "user": "postgres",        # POSTGRES_USER
-    "password": "1234@abcd",   # POSTGRES_PASSWORD
+    "password": os.getenv("DB_PASSWORD"),   # POSTGRES_PASSWORD (ตั้งผ่าน env ห้ามเขียนลงโค้ด)
     "dbname": "postgres",      # POSTGRES_DB  (psycopg ใช้ dbname ไม่ใช่ database)
 }
 
