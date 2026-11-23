@@ -7,6 +7,26 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
+def _load_env_file(path: str) -> None:
+    """โหลดค่าจากไฟล์ .env (บรรทัดละ KEY=VALUE) ถ้ามี — ไม่ทับค่าที่ตั้งใน environment ไว้แล้ว
+    ไฟล์ .env อยู่ใน .gitignore จึงเก็บรหัสผ่านไว้ในเครื่องได้โดยไม่ถูก push (ดูตัวอย่างใน .env.example)"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+_load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))   # อ่านจากโฟลเดอร์เดียวกับ db.py ไม่ว่ารันจากที่ไหน
+
 # ---- ตั้งค่าการเชื่อมต่อ (Postgres บนเครื่อง Windows ผ่าน Tailscale) ----
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "100.117.187.28"),

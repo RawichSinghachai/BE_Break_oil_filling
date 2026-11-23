@@ -5,21 +5,14 @@
          python test_db.py ABC123         # ส่ง target ผ่าน command line
 """
 
-import os
 import sys
 
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-# ---- ตั้งค่าการเชื่อมต่อ ----
-DB_CONFIG = {
-    "host": "100.117.187.28",
-    "port": 5432,
-    "user": "postgres",        # POSTGRES_USER
-    "password": os.getenv("DB_PASSWORD"),   # POSTGRES_PASSWORD (ตั้งผ่าน env ห้ามเขียนลงโค้ด)
-    "dbname": "postgres",      # POSTGRES_DB  (psycopg ใช้ dbname ไม่ใช่ database)
-}
+# ---- ตั้งค่าการเชื่อมต่อ: ใช้ชุดเดียวกับ db.py (อ่านจาก env / ไฟล์ .env ไม่เขียนรหัสผ่านลงโค้ด) ----
+from db import DB_CONFIG
 
 SCHEMA_NAME = "public"
 TABLE_NAME = "machine"
