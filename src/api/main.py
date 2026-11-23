@@ -1,101 +1,151 @@
 """
-main.py — รับข้อมูลจาก MQTT -> filter side/pgnum -> predict -> บันทึก database อัตโนมัติ -> ให้ดึงผลผ่าน API
+main.py — ดึงข้อมูลจากตาราง machine -> ประกอบเป็นรถทีละคัน -> predict -> บันทึก database อัตโนมัติ -> ให้ดึงผลผ่าน API
 
-flow: batch รถมาจาก MQTT (topic TOPIC_IN) -> predict -> save_result ลง DB เอง -> publish ผลออก TOPIC_OUT
-API มีไว้ "ดึงผล" อย่างเดียว (ไม่มี endpoint ยิง predict เอง — ใช้ MQTT เป็น trigger ทางเดียว)
+flow: poller (background task) ดึงแถวใหม่จากตาราง machine ทุก POLL_SECONDS วินาที -> cycle.CycleBuffer ตัดเป็นรอบของรถแต่ละคัน
+      (ตัดตอน step ไม่ใช่ 0 -> 0) -> predict -> save_result ลง DB เอง
+API มีไว้ "ดึงผล" อย่างเดียว (ไม่มี endpoint ยิง predict เอง)
 
-ติดตั้ง:  pip install fastapi uvicorn "paho-mqtt>=2"
-รัน:      uvicorn main:app --host 0.0.0.0 --port 8001      (อย่าใช้ --reload หรือ --workers > 1)
+ติดตั้ง:  pip install fastapi uvicorn
+รัน:      uvicorn main:app --host 0.0.0.0 --port 8001      (อย่าใช้ --reload; ถ้ารันหลาย worker จะมี poller ทำงานแค่ตัวเดียว ด้วย advisory lock)
 เอกสาร API (ลองยิงได้ในเว็บ):  http://<ip>:8001/docs
+
+ตัวแปร environment (ไม่บังคับ):
+  POLLER_ENABLED=0   ปิด poller (รันแค่ API) — ใช้ตอนที่ยังมี API ตัวเก่าทำหน้าที่ predict อยู่
+  POLLER_DRY_RUN=1   poller predict แล้ว log ผลอย่างเดียว ไม่บันทึกลง DB
+  POLL_SECONDS       ความถี่ดึงข้อมูล (ค่าเริ่มต้น 2)
 """
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import asyncio
+import logging
+import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, APIRouter, Query
 from fastapi.responses import HTMLResponse
 
 
 import pandas as pd
-import paho.mqtt.client as mqtt
 
 import db                                   # save_result_from_dict / get_predictions / get_prediction_by_bn / get_latest_filling
-from predict import run_prediction        # โมเดล LH / PGNum 20
-# from predict_lh12 import run_prediction as run_lh12
-# from predict_rh20 import run_prediction as run_rh20
+from cycle import CycleBuffer, Cycle, side_to_lh
+from predict import run_prediction        # โมเดล PGNum 20 (ใช้ได้ทั้ง LH และ RH)
+# from predict_pg12 import run_prediction as run_pg12
 
-BROKER = "100.124.242.18"
-PORT = 1883
-TOPIC_IN = "tmt/banpho/assembly/final3/filling_equipment/BFC/raw_data/LH/20"
-TOPIC_OUT = "filling/result"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("poller")
 
-# (side, pgnum) -> ฟังก์ชัน predict ของโมเดลนั้น
+POLLER_ENABLED = os.getenv("POLLER_ENABLED", "1") != "0"
+POLLER_DRY_RUN = os.getenv("POLLER_DRY_RUN", "0") == "1"
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2"))
+BATCH_ROWS = 5000                           # จำนวนแถวสูงสุดต่อการดึง 1 ครั้ง (ดึงต่อทันทีถ้ายังมีค้าง)
+WARMUP_ROWS = 300                           # ตอนเริ่มระบบ replay แถวท้ายตารางเท่านี้ เพื่อให้รอบที่กำลังเดินอยู่ครบ
+DEDUPE_WINDOW = timedelta(hours=1)          # เคยบันทึก (side, pgnum, bn) นี้ภายในช่วงนี้แล้ว = ไม่บันทึกซ้ำ
+RETRY_MAX_SECONDS = 30                      # DB ล่ม: หน่วงเวลาลองใหม่ สูงสุดเท่านี้
+
+# pgnum -> ฟังก์ชัน predict ของโมเดลนั้น
+# โมเดลหนึ่งตัวใช้ได้ทั้ง LH และ RH : ฝั่ง RH จะถูกเปลี่ยนชื่อคอลัมน์ rh_* -> lh_* ก่อนส่งเข้าโมเดล (cycle.side_to_lh)
+# เพิ่มรุ่นใหม่ = เติมบรรทัดเดียวที่นี่ (ฟังก์ชัน predict ต้องรับ df ที่มีคอลัมน์ lh_* เหมือน predict.run_prediction)
 MODELS = {
-    ("LH", 20): run_prediction,
-    # ("LH", 12): run_lh12,
-    # ("RH", 20): run_rh20,
+    20: run_prediction,
+    # 12: run_pg12,
 }
+SIDES = ("LH", "RH")
 
 
-def predict_message(data):
-    """filter + เตรียมข้อมูล + predict + บันทึก database อัตโนมัติ
-    คืน result หรือ None ถ้าไม่มีโมเดล"""
-    side = str(data["side"]).upper()
-    pgnum = int(data["pgnum"])
-    predict_fn = MODELS.get((side, pgnum))
+def predict_cycle(cycle: Cycle):
+    """predict + เตรียมผลให้พร้อมบันทึก (sync, หนัก: เรียกผ่าน asyncio.to_thread)
+    คืน result หรือ None ถ้าไม่มีโมเดลของ pgnum นี้"""
+    predict_fn = MODELS.get(cycle.pgnum)
     if predict_fn is None:
         return None
 
-    df = pd.DataFrame(data["payload"])
+    df = pd.DataFrame([side_to_lh(r, cycle.side) for r in cycle.rows])
     df.columns = df.columns.str.lower()
     df = df.sort_values("recorded_at")
     df["id"] = range(len(df))
 
     result = predict_fn(df)
+    return {"side": cycle.side, "pgnum": cycle.pgnum, "asn": cycle.asn,
+            "predicted_at": datetime.now().isoformat(timespec="seconds"),
+            **result}
 
-    result = {"side": side, "pgnum": pgnum,
-              "predicted_at": datetime.now().isoformat(timespec="seconds"),
-              **result}
 
+def process_cycle(cycle: Cycle):
+    """รอบที่จบแล้ว 1 รอบ -> predict -> บันทึก (sync: เรียกผ่าน asyncio.to_thread)  ไม่ raise ออกไป: รอบเดียวพังไม่ทำให้ poller หยุด"""
+    tag = f"{cycle.side} PG{cycle.pgnum} BN {cycle.bn}"
     try:
-        db.save_result_from_dict(result)     # <-- เขียนลง DB อัตโนมัติทุกคันที่ predict เสร็จ
-    except Exception as e:                  # database ล่ม ไม่ให้ผล predict หาย
-        print("save database ไม่สำเร็จ:", e)
+        if cycle.bn is None or cycle.pgnum is None:
+            log.warning("ข้ามรอบ %s: ไม่มี bn/pgnum", tag)
+            return
+        if cycle.pgnum not in MODELS:
+            log.info("skip: ไม่มีโมเดลสำหรับ %s", tag)
+            return
+        if db.prediction_exists(cycle.side, cycle.pgnum, cycle.bn, datetime.now().astimezone() - DEDUPE_WINDOW):
+            log.info("skip: %s เคยบันทึกแล้ว", tag)
+            return
 
-    return result
+        result = predict_cycle(cycle)
+        note = " (ถูกตัดที่เพดานความยาว)" if cycle.truncated else ""
+        log.info("%s length=%s overall_pass=%s%s", tag, result["length"], result["overall_pass"], note)
+        if POLLER_DRY_RUN:
+            return
+        try:
+            db.save_result_from_dict(result)        # <-- เขียนลง DB อัตโนมัติทุกคันที่ predict เสร็จ
+        except Exception:                           # database ล่ม ไม่ให้ poller ตาย
+            log.exception("save database ไม่สำเร็จ: %s", tag)
+    except Exception:
+        log.exception("predict ไม่สำเร็จ: %s", tag)
 
 
-# ---------- MQTT (trigger หลัก: batch รถเข้ามา -> predict -> save) ----------
-def on_connect(client, userdata, flags, reason_code, properties):
-    print("MQTT connected, subscribe", TOPIC_IN)
-    client.subscribe(TOPIC_IN)
+async def poll_loop():
+    """ดึงแถวใหม่จากตาราง machine ทีละก้อน -> CycleBuffer -> predict + save  (cancel ได้ตอนปิดแอป)"""
+    sides = list(SIDES)                                     # buffer ต่อข้าง: LH และ RH ใช้โมเดลเดียวกันตาม pgnum
+    buffers: dict[str, CycleBuffer] = {}
+    cursor = None                                           # id แถวสุดท้ายที่ประมวลผลแล้ว (None = ยังไม่ได้ warm-up)
+    lock = db.PollerLock()
+    delay = POLL_SECONDS
 
-
-def on_message(client, userdata, msg):
+    log.info("poller เริ่มทำงาน sides=%s dry_run=%s every=%ss", sides, POLLER_DRY_RUN, POLL_SECONDS)
     try:
-        data = json.loads(msg.payload)
-        result = predict_message(data)
-    except Exception as e:                  # ข้อความเสีย 1 ชิ้นไม่ทำให้ระบบหยุด
-        print("error:", e)
-        return
-    if result is None:
-        print(f"skip: ไม่มีโมเดลสำหรับ {data.get('side')} PG{data.get('pgnum')}")
-        return
-    try:                                    # publish พังไม่ทำให้ callback / thread MQTT ล่ม
-        print(f"{result['side']} PG{result['pgnum']} BN {result['bn']} "
-              f"overall_pass={result['overall_pass']}")
-        # _json_safe: numpy -> python, NaN/Inf -> None (ให้เป็น JSON ที่ valid)
-        payload = json.dumps(db._json_safe(result), allow_nan=False)
-        client.publish(f"{TOPIC_OUT}/{result['side']}/{result['pgnum']}", payload, qos=1)
-    except Exception as e:
-        print("publish ไม่สำเร็จ:", e)
+        while True:
+            try:
+                # ถือ advisory lock ตลอด: มี poller ได้ตัวเดียว (ตัวอื่นรอรับช่วงต่อถ้าตัวนี้ตาย)
+                if not await asyncio.to_thread(lock.held):
+                    if not await asyncio.to_thread(lock.acquire):
+                        log.info("มี poller อื่นทำงานอยู่แล้ว (advisory lock) — รอ")
+                        await asyncio.sleep(RETRY_MAX_SECONDS)
+                        continue
+                    cursor = None                           # ได้ล็อกใหม่ -> warm-up ใหม่ ไม่ใช้สถานะเก่าที่อาจค้าง
 
+                if cursor is None:
+                    # เริ่มระบบ: replay แถวท้ายตารางแบบเงียบ (ไม่ predict) ให้รอบที่กำลังเดินอยู่ครบ — ไม่ย้อน predict รอบเก่า
+                    tail = await asyncio.to_thread(db.get_machine_tail, WARMUP_ROWS)
+                    buffers = {s: CycleBuffer(s) for s in sides}
+                    for row in tail:
+                        for buf in buffers.values():
+                            buf.update(row)
+                    cursor = tail[-1]["id"] if tail else 0
+                    log.info("warm-up เสร็จ: replay %d แถว, เริ่มดึงต่อจาก id > %s", len(tail), cursor)
 
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-# ยังไม่ connect ตรงนี้ — ไปเริ่มใน lifespan หลัง db.pool.open() เพื่อไม่ให้ข้อความเข้ามาก่อน DB พร้อม
+                rows = await asyncio.to_thread(db.get_machine_rows_after, cursor, BATCH_ROWS)
+                for row in rows:
+                    if row["id"] != cursor + 1:
+                        log.warning("id ข้ามช่วง: %s -> %s", cursor, row["id"])
+                    cursor = row["id"]
+                    for buf in buffers.values():
+                        cycle = buf.update(row)
+                        if cycle is not None:
+                            await asyncio.to_thread(process_cycle, cycle)   # ทีละรอบ ไม่บล็อก event loop
+
+                delay = 0 if len(rows) == BATCH_ROWS else POLL_SECONDS  # ยังมีค้างอยู่ -> ดึงต่อทันที
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                delay = min(max(delay, 1) * 2, RETRY_MAX_SECONDS)       # DB ล่ม ฯลฯ -> หน่วงเวลาแล้วลองใหม่
+                log.exception("poll ไม่สำเร็จ ลองใหม่ใน %ss", delay)
+            await asyncio.sleep(delay)
+    finally:
+        lock.release()
 
 
 # ---------- API (ดึงผลอย่างเดียว) ----------
@@ -103,11 +153,16 @@ mqtt_client.on_message = on_message
 @asynccontextmanager
 async def lifespan(app):
     db.pool.open()                          # 1) เปิด connection pool (sync) ก่อน
-    mqtt_client.connect_async(BROKER, PORT) # 2) ค่อยเริ่ม MQTT (ไม่ค้างถ้า broker ยังไม่พร้อม จะต่อใหม่ให้เอง)
-    mqtt_client.loop_start()                #    MQTT ทำงานใน thread แยก
+    poller = asyncio.create_task(poll_loop()) if POLLER_ENABLED else None   # 2) ค่อยเริ่ม poller
+    if poller is None:
+        log.info("POLLER_ENABLED=0 -> ไม่เปิด poller (รันแค่ API)")
     yield
-    mqtt_client.loop_stop()                 # ปิดตามลำดับย้อนกลับ: MQTT ก่อน แล้วค่อย DB
-    mqtt_client.disconnect()
+    if poller is not None:                  # ปิดตามลำดับย้อนกลับ: poller ก่อน แล้วค่อย DB
+        poller.cancel()
+        try:
+            await poller
+        except asyncio.CancelledError:
+            pass
     db.pool.close()
 
 
@@ -129,6 +184,7 @@ async def realtime(ws: WebSocket):
                     "lh": {
                         "bn":               row["lh_bn"],
                         "pgnum":            row["lh_pgnum"],
+                        "stepnum":          row["lh_stepnum"],
                         "filling_pressure": row["lh_fillingpressure"],
                         "filling_volume":   row["lh_fillingvolume"],
                         "vacuumgun":        row["lh_vacuumgun"],
@@ -136,6 +192,7 @@ async def realtime(ws: WebSocket):
                     "rh": {
                         "bn":               row["rh_bn"],
                         "pgnum":            row["rh_pgnum"],
+                        "stepnum":          row["rh_stepnum"],
                         "filling_pressure": row["rh_fillingpressure"],
                         "filling_volume":   row["rh_fillingvolume"],
                         "vacuumgun":        row["rh_vacuumgun"],

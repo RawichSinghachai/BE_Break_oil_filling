@@ -1,6 +1,7 @@
 import math
 import os
 
+import psycopg
 from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -36,8 +37,8 @@ def get_latest_filling() -> dict | None:
     filling_pressure / filling_volume / vacuumgun ทั้ง LH, RH (+ recorded_at)
     คืน dict (key ตัวพิมพ์เล็ก) หรือ None ถ้ายังไม่มีข้อมูล"""
     sql = """
-        SELECT Continue, Master_on, Machine_fault, LH_BN, LH_PgNum, LH_FillingPressure, LH_FillingVolume, LH_VacuumGun,
-            RH_BN, RH_PgNum, RH_FillingPressure, RH_FillingVolume, RH_VacuumGun,
+        SELECT Continue, Master_on, Machine_fault, LH_BN, LH_PgNum, LH_StepNum, LH_FillingPressure, LH_FillingVolume, LH_VacuumGun,
+            RH_BN, RH_PgNum, RH_StepNum, RH_FillingPressure, RH_FillingVolume, RH_VacuumGun,
             Recorded_at
         FROM machine
         ORDER BY id DESC
@@ -240,6 +241,95 @@ def get_machines_by_bn(bn: str) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, {"bn": bn})
             return cur.fetchall()
+
+# ======================================================================
+# READ สำหรับ poller: ดึงแถวดิบจากตาราง machine ไปประกอบเป็น "รอบของรถ" (ดู cycle.py)
+# ======================================================================
+def get_machine_rows_after(after_id: int, limit: int = 5000) -> list[dict]:
+    """แถวใหม่ที่ id > after_id เรียงจากเก่าไปใหม่ (ใช้ primary key -> เร็ว) ทุกคอลัมน์ key ตัวพิมพ์เล็ก"""
+    sql = "SELECT * FROM machine WHERE id > %(after_id)s ORDER BY id LIMIT %(limit)s"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"after_id": after_id, "limit": limit})
+            return cur.fetchall()
+
+
+def get_machine_tail(n: int) -> list[dict]:
+    """n แถวล่าสุดของตาราง machine เรียงจากเก่าไปใหม่ (ใช้ตอนเริ่มระบบเพื่อ replay รอบที่กำลังเดินอยู่)"""
+    sql = "SELECT * FROM (SELECT * FROM machine ORDER BY id DESC LIMIT %(n)s) t ORDER BY id"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"n": n})
+            return cur.fetchall()
+
+
+def get_machine_rows_between(id_from: int, id_to: int) -> list[dict]:
+    """แถวที่ id_from <= id <= id_to เรียงจากเก่าไปใหม่ (ใช้ตอน replay / ตรวจย้อนหลัง)"""
+    sql = "SELECT * FROM machine WHERE id BETWEEN %(a)s AND %(b)s ORDER BY id"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"a": id_from, "b": id_to})
+            return cur.fetchall()
+
+
+class PollerLock:
+    """Postgres advisory lock กัน poller รันซ้ำ (เผลอรันหลาย process / worker) — ถือไว้ด้วย connection แยกตลอดอายุ poller
+    process ที่ตายหรือ connection ที่หลุดจะปล่อยล็อกให้เอง ตัวอื่นเข้ามารับช่วงต่อได้"""
+    KEY = 0x6D61727550  # ตัวเลขคงที่ใด ๆ ที่ไม่ชนกับ lock ตัวอื่นในฐานข้อมูลนี้
+
+    def __init__(self):
+        self.conn = None
+
+    def held(self) -> bool:
+        """ยังถือล็อกอยู่ไหม (ลองยิง query: connection หลุด = ล็อกหาย)"""
+        if self.conn is None:
+            return False
+        try:
+            self.conn.execute("SELECT 1")
+            return True
+        except Exception:
+            self.release()
+            return False
+
+    def acquire(self) -> bool:
+        if self.held():
+            return True
+        conn = None
+        try:
+            conn = psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=10)
+            ok = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.KEY,)).fetchone()[0]
+        except Exception:
+            if conn is not None:
+                conn.close()
+            raise
+        if ok:
+            self.conn = conn
+        else:
+            conn.close()
+        return bool(ok)
+
+    def release(self):
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def prediction_exists(side: str, pgnum: int, bn: int, since) -> bool:
+    """เคยบันทึกผลของ (side, pgnum, bn) นี้ตั้งแต่เวลา since แล้วหรือยัง (กันบันทึกซ้ำ)
+    bn ซ้ำได้ในระยะยาว (ทำซ้ำ) จึงเช็คเฉพาะช่วงเวลาที่กำหนด"""
+    sql = f"""
+        SELECT 1 FROM {PRED_TABLE}
+        WHERE side = %(side)s AND pgnum = %(pgnum)s AND bn = %(bn)s AND predicted_at >= %(since)s
+        LIMIT 1
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {"side": side, "pgnum": pgnum, "bn": bn, "since": since})
+            return cur.fetchone() is not None
+
 
 # ======================================================================
 # WRITE: บันทึกผล predict ลงตาราง prediction_break_oil_filling_machine
