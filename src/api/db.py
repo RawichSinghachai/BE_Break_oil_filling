@@ -43,13 +43,28 @@ DATABASE_URL = os.getenv("DATABASE_URL") or make_conninfo(**DB_CONFIG)
 PRED_TABLE = "prediction_break_oil_filling_machine"
 MACHINE_TABLE = "machine"
 
+# ---- กัน connection ตายเงียบ ๆ (DB อยู่ไกลผ่าน Tailscale: เน็ตสะดุด/เครื่องหลับ แล้ว connection ค้างโดยไม่มีใครรู้) ----
+# ฝั่ง client: ถ้า DB ไม่ตอบ keepalive ~60 วิ (30 + 10x3) ให้ถือว่าตายและ error ออกมา แทนที่จะค้างรอไม่รู้จบ
+# ฝั่ง server: สั่งให้ DB ตรวจ client ของ session นี้ด้วย -> ถ้า client หายไป DB ปิด session เองใน ~1-2 นาที
+#              (สำคัญกับ advisory lock ของ poller: ไม่งั้น session ผีถือ lock ค้างได้เป็นชั่วโมง)
+CONNECT_KWARGS = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 45000,   # ms; มีผลบน Linux (ระบบอื่น libpq ข้ามให้เอง)
+    "options": "-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3",
+}
+
 # ---- connection pool (เปิดครั้งเดียว ใช้ซ้ำทั้งแอป) ----
 pool = ConnectionPool(
     conninfo=DATABASE_URL,
     min_size=1,
     max_size=10,
     open=False,
-    kwargs={"row_factory": dict_row},  # ผลลัพธ์เป็น dict; JSONB แปลงเป็น dict/list ให้อัตโนมัติ
+    kwargs={"row_factory": dict_row, **CONNECT_KWARGS},  # ผลลัพธ์เป็น dict; JSONB แปลงเป็น dict/list ให้อัตโนมัติ
+    check=ConnectionPool.check_connection,               # ตรวจ connection ก่อนส่งให้ใช้: ตัวที่ตายไปแล้วจะถูกทิ้งแล้วต่อใหม่
 )
 
 def get_latest_filling() -> dict | None:
@@ -316,7 +331,7 @@ class PollerLock:
             return True
         conn = None
         try:
-            conn = psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=10)
+            conn = psycopg.connect(DATABASE_URL, autocommit=True, **CONNECT_KWARGS)
             ok = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.KEY,)).fetchone()[0]
         except Exception:
             if conn is not None:

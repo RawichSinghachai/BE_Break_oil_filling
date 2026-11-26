@@ -14,11 +14,12 @@ API มีไว้ "ดึงผล" อย่างเดียว (ไม่�
   POLLER_DRY_RUN=1   poller predict แล้ว log ผลอย่างเดียว ไม่บันทึกลง DB
   POLL_SECONDS       ความถี่ดึงข้อมูล (ค่าเริ่มต้น 2)
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import asyncio
 import logging
 import os
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, APIRouter, Query
 from fastapi.responses import HTMLResponse
@@ -39,8 +40,10 @@ POLLER_DRY_RUN = os.getenv("POLLER_DRY_RUN", "0") == "1"
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "2"))
 BATCH_ROWS = 5000                           # จำนวนแถวสูงสุดต่อการดึง 1 ครั้ง (ดึงต่อทันทีถ้ายังมีค้าง)
 WARMUP_ROWS = 300                           # ตอนเริ่มระบบ replay แถวท้ายตารางเท่านี้ เพื่อให้รอบที่กำลังเดินอยู่ครบ
-DEDUPE_WINDOW = timedelta(hours=1)          # เคยบันทึก (side, pgnum, bn) นี้ภายในช่วงนี้แล้ว = ไม่บันทึกซ้ำ
+DEDUPE_MARGIN = timedelta(minutes=5)        # เคยบันทึก (side, pgnum, bn) นี้ตั้งแต่ "เวลาที่รอบจบ - margin นี้" แล้ว = ไม่บันทึกซ้ำ
 RETRY_MAX_SECONDS = 30                      # DB ล่ม: หน่วงเวลาลองใหม่ สูงสุดเท่านี้
+DB_CALL_TIMEOUT = 60                        # เรียก DB (อ่าน/ล็อก) นานกว่านี้ = ถือว่าค้าง ข้ามไปลองรอบใหม่ (ไม่ให้ loop ค้างเงียบ)
+STATUS_LOG_SECONDS = 60                     # log สถานะ poller ทุกกี่วินาที
 
 # pgnum -> ฟังก์ชัน predict ของโมเดลนั้น
 # โมเดลหนึ่งตัวใช้ได้ทั้ง LH และ RH : ฝั่ง RH จะถูกเปลี่ยนชื่อคอลัมน์ rh_* -> lh_* ก่อนส่งเข้าโมเดล (cycle.side_to_lh)
@@ -50,6 +53,22 @@ MODELS = {
     # 12: run_pg12,
 }
 SIDES = ("LH", "RH")
+
+# สถานะของ poller (ดูได้ที่ GET /api/poller/status และใน log ทุก STATUS_LOG_SECONDS วินาที)
+POLLER_STATUS = {
+    "started_at": None,        # เวลาที่ poller เริ่ม
+    "lock_held": False,        # ถือ advisory lock อยู่ไหม (False = รอ/เสีย lock ไม่ได้ประมวลผล)
+    "cursor": None,            # id แถวสุดท้ายที่ประมวลผลแล้ว
+    "last_row_at": None,       # recorded_at ของแถวสุดท้ายที่ประมวลผล (ใช้ดูว่าข้อมูลใหม่ล่าสุดเมื่อไหร่)
+    "last_poll_ok": None,      # เวลา (unix) ที่ poll สำเร็จล่าสุด
+    "last_error": None,        # ข้อความ error ล่าสุด (+ เวลา)
+    "last_saved": None,        # รอบล่าสุดที่บันทึกสำเร็จ
+    "counts": {"cycles": 0, "saved": 0, "skipped": 0, "errors": 0},
+}
+
+
+def _count(name: str) -> None:
+    POLLER_STATUS["counts"][name] += 1
 
 
 def predict_cycle(cycle: Cycle):
@@ -76,12 +95,18 @@ def process_cycle(cycle: Cycle):
     try:
         if cycle.bn is None or cycle.pgnum is None:
             log.warning("ข้ามรอบ %s: ไม่มี bn/pgnum", tag)
+            _count("skipped")
             return
         if cycle.pgnum not in MODELS:
             log.info("skip: ไม่มีโมเดลสำหรับ %s", tag)
+            _count("skipped")
             return
-        if db.prediction_exists(cycle.side, cycle.pgnum, cycle.bn, datetime.now().astimezone() - DEDUPE_WINDOW):
+        # ผลของรอบนี้ถ้ามีอยู่แล้วต้องถูกบันทึก "หลังรอบจบ" -> เช็คตั้งแต่เวลาจบรอบ (ลบ margin กันนาฬิกาเครื่อง OPC กับ DB เหลื่อมกัน)
+        # ใช้ได้ถูกต้องแม้ต้องประมวลผลย้อนหลังนานหลังหลุด และ bn ที่ถูกทำซ้ำคนละเวลาไม่ถูกนับว่าซ้ำ
+        since = cycle.rows[-1]["recorded_at"] - DEDUPE_MARGIN
+        if db.prediction_exists(cycle.side, cycle.pgnum, cycle.bn, since):
             log.info("skip: %s เคยบันทึกแล้ว", tag)
+            _count("skipped")
             return
 
         result = predict_cycle(cycle)
@@ -91,60 +116,103 @@ def process_cycle(cycle: Cycle):
             return
         try:
             db.save_result_from_dict(result)        # <-- เขียนลง DB อัตโนมัติทุกคันที่ predict เสร็จ
+            _count("saved")
+            POLLER_STATUS["last_saved"] = {"side": cycle.side, "pgnum": cycle.pgnum, "bn": cycle.bn,
+                                           "at": datetime.now().astimezone().isoformat(timespec="seconds")}
         except Exception:                           # database ล่ม ไม่ให้ poller ตาย
+            _count("errors")
             log.exception("save database ไม่สำเร็จ: %s", tag)
     except Exception:
+        _count("errors")
         log.exception("predict ไม่สำเร็จ: %s", tag)
 
 
+async def _db_call(fn, *args):
+    """เรียกฟังก์ชัน DB (sync) ใน thread พร้อม timeout — ค้างเกิน DB_CALL_TIMEOUT = TimeoutError ให้ loop ข้ามไปลองใหม่
+    (thread ที่ค้างจะจบเองเมื่อ keepalive/timeout ของ connection ทำงาน ดู db.CONNECT_KWARGS)"""
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args), DB_CALL_TIMEOUT)
+
+
+def _log_status(cursor):
+    st = POLLER_STATUS
+    lag = None
+    if st["last_row_at"] is not None:
+        lag = max(0.0, (datetime.now(timezone.utc) - st["last_row_at"]).total_seconds())   # กันค่าติดลบจากนาฬิกาเครื่อง OPC เหลื่อมกับเครื่องนี้
+    c = st["counts"]
+    log.info("poller ปกติ: id=%s ข้อมูลล่าสุดห่างจากตอนนี้ %s | รอบที่เห็น=%d บันทึก=%d ข้าม=%d ผิดพลาด=%d",
+             cursor, "-" if lag is None else f"{lag:.0f}s", c["cycles"], c["saved"], c["skipped"], c["errors"])
+
+
 async def poll_loop():
-    """ดึงแถวใหม่จากตาราง machine ทีละก้อน -> CycleBuffer -> predict + save  (cancel ได้ตอนปิดแอป)"""
-    sides = list(SIDES)                                     # buffer ต่อข้าง: LH และ RH ใช้โมเดลเดียวกันตาม pgnum
-    buffers: dict[str, CycleBuffer] = {}
-    cursor = None                                           # id แถวสุดท้ายที่ประมวลผลแล้ว (None = ยังไม่ได้ warm-up)
+    """ดึงแถวใหม่จากตาราง machine ทีละก้อน -> CycleBuffer -> predict + save  (cancel ได้ตอนปิดแอป)
+
+    สถานะ (cursor + buffer ของรอบที่กำลังเดิน) อยู่ตลอดอายุ process: เสีย lock / DB หลุด แล้วกลับมา "ทำงานต่อจากจุดเดิม"
+    รอบที่จบระหว่างที่หลุดจะถูกประมวลผลย้อนหลัง (ไม่ข้าม) — warm-up (replay เงียบ) ทำครั้งเดียวตอนเริ่ม process เท่านั้น
+    ถ้าระหว่างที่เสีย lock มี poller ตัวอื่นประมวลผลรอบเดียวกันไปแล้ว prediction_exists จะกันไม่ให้บันทึกซ้ำ"""
+    st = POLLER_STATUS
+    buffers = {s: CycleBuffer(s) for s in SIDES}            # buffer ต่อข้าง: LH และ RH ใช้โมเดลเดียวกันตาม pgnum
+    cursor = None                                           # id แถวสุดท้ายที่ประมวลผลแล้ว (None = ยังไม่เคย warm-up)
     lock = db.PollerLock()
     delay = POLL_SECONDS
+    last_status_log = 0.0
+    st["started_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
 
-    log.info("poller เริ่มทำงาน sides=%s dry_run=%s every=%ss", sides, POLLER_DRY_RUN, POLL_SECONDS)
+    log.info("poller เริ่มทำงาน sides=%s dry_run=%s every=%ss", list(SIDES), POLLER_DRY_RUN, POLL_SECONDS)
     try:
         while True:
             try:
                 # ถือ advisory lock ตลอด: มี poller ได้ตัวเดียว (ตัวอื่นรอรับช่วงต่อถ้าตัวนี้ตาย)
-                if not await asyncio.to_thread(lock.held):
-                    if not await asyncio.to_thread(lock.acquire):
+                if not await _db_call(lock.held):
+                    if st["lock_held"]:
+                        log.warning("เสีย advisory lock (connection หลุด) — หยุดประมวลผลชั่วคราว รอต่อ lock ใหม่")
+                    st["lock_held"] = False
+                    if not await _db_call(lock.acquire):
                         log.info("มี poller อื่นทำงานอยู่แล้ว (advisory lock) — รอ")
                         await asyncio.sleep(RETRY_MAX_SECONDS)
                         continue
-                    cursor = None                           # ได้ล็อกใหม่ -> warm-up ใหม่ ไม่ใช้สถานะเก่าที่อาจค้าง
+                    log.info("ได้ advisory lock แล้ว%s",
+                             "" if cursor is None else f" — ทำงานต่อจาก id > {cursor} (รอบที่จบระหว่างหลุดจะถูกประมวลผลย้อนหลัง)")
+                st["lock_held"] = True
 
                 if cursor is None:
-                    # เริ่มระบบ: replay แถวท้ายตารางแบบเงียบ (ไม่ predict) ให้รอบที่กำลังเดินอยู่ครบ — ไม่ย้อน predict รอบเก่า
-                    tail = await asyncio.to_thread(db.get_machine_tail, WARMUP_ROWS)
-                    buffers = {s: CycleBuffer(s) for s in sides}
+                    # เริ่ม process: replay แถวท้ายตารางแบบเงียบ (ไม่ predict) ให้รอบที่กำลังเดินอยู่ครบ — ไม่ย้อน predict รอบเก่า
+                    tail = await _db_call(db.get_machine_tail, WARMUP_ROWS)
                     for row in tail:
                         for buf in buffers.values():
                             buf.update(row)
                     cursor = tail[-1]["id"] if tail else 0
+                    if tail:
+                        st["last_row_at"] = tail[-1]["recorded_at"]
                     log.info("warm-up เสร็จ: replay %d แถว, เริ่มดึงต่อจาก id > %s", len(tail), cursor)
 
-                rows = await asyncio.to_thread(db.get_machine_rows_after, cursor, BATCH_ROWS)
+                rows = await _db_call(db.get_machine_rows_after, cursor, BATCH_ROWS)
                 for row in rows:
                     if row["id"] != cursor + 1:
                         log.warning("id ข้ามช่วง: %s -> %s", cursor, row["id"])
                     cursor = row["id"]
+                    st["last_row_at"] = row["recorded_at"]
                     for buf in buffers.values():
                         cycle = buf.update(row)
                         if cycle is not None:
-                            await asyncio.to_thread(process_cycle, cycle)   # ทีละรอบ ไม่บล็อก event loop
+                            _count("cycles")
+                            await asyncio.to_thread(process_cycle, cycle)   # ทีละรอบ ไม่บล็อก event loop (ไม่ใส่ timeout: ห้ามตัดกลางคันตอนบันทึก)
 
+                st["cursor"] = cursor
+                st["last_poll_ok"] = time.time()
                 delay = 0 if len(rows) == BATCH_ROWS else POLL_SECONDS  # ยังมีค้างอยู่ -> ดึงต่อทันที
+                if time.monotonic() - last_status_log >= STATUS_LOG_SECONDS:
+                    last_status_log = time.monotonic()
+                    _log_status(cursor)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                delay = min(max(delay, 1) * 2, RETRY_MAX_SECONDS)       # DB ล่ม ฯลฯ -> หน่วงเวลาแล้วลองใหม่
+            except Exception as e:
+                _count("errors")
+                st["last_error"] = f"{datetime.now().astimezone().isoformat(timespec='seconds')} {type(e).__name__}: {e}"[:300]
+                delay = min(max(delay, 1) * 2, RETRY_MAX_SECONDS)       # DB ล่ม ฯลฯ -> หน่วงเวลาแล้วลองใหม่ (สถานะเดิมยังอยู่)
                 log.exception("poll ไม่สำเร็จ ลองใหม่ใน %ss", delay)
             await asyncio.sleep(delay)
     finally:
+        st["lock_held"] = False
         lock.release()
 
 
@@ -213,6 +281,34 @@ async def realtime(ws: WebSocket):
 def root():
     """เช็คว่า API ทำงานอยู่ — GET /api -> {"message": "Hello World"}"""
     return {"message": "Hello World"}
+
+
+@api.get("/poller/status")
+def poller_status():
+    """สถานะ poller (ดึงข้อมูล -> predict -> บันทึก) ไว้เช็คว่ายังทำงานอยู่ไหม
+    healthy = poll สำเร็จเมื่อไม่นานนี้ + ถือ lock อยู่ ; data_lag_seconds = ข้อมูลใน machine ใหม่ล่าสุดห่างจากตอนนี้กี่วินาที
+    (healthy แต่ data_lag สูง = poller ปกติ แต่ตัวเก็บข้อมูลไม่ส่งแถวใหม่เข้ามา)"""
+    st = POLLER_STATUS
+    now = time.time()
+    last_ok = st["last_poll_ok"]
+    poll_age = None if last_ok is None else round(now - last_ok, 1)
+    last_row_at = st["last_row_at"]
+    lag = None if last_row_at is None else round(max(0.0, (datetime.now(timezone.utc) - last_row_at).total_seconds()), 1)
+    alive = poll_age is not None and poll_age <= max(30.0, POLL_SECONDS * 5)
+    return {
+        "enabled": POLLER_ENABLED,
+        "dry_run": POLLER_DRY_RUN,
+        "healthy": bool(POLLER_ENABLED and alive and st["lock_held"]),
+        "lock_held": st["lock_held"],
+        "started_at": st["started_at"],
+        "last_poll_seconds_ago": poll_age,
+        "cursor": st["cursor"],
+        "last_row_at": None if last_row_at is None else last_row_at.isoformat(),
+        "data_lag_seconds": lag,
+        "counts": dict(st["counts"]),
+        "last_saved": st["last_saved"],
+        "last_error": st["last_error"],
+    }
 
 
 @api.get("/predictions")
@@ -309,33 +405,3 @@ def machines_by_bn(bn: int):
 
 
 app.include_router(api)   # ต้องอยู่หลังประกาศ route ทั้งหมดของ api
-
-# @app.get("/models")
-# def list_models():
-#     """โมเดลที่ใช้ได้"""
-#     return [{"side": s, "pgnum": p} for s, p in MODELS]
-
-
-# @app.get("/results")
-# def list_results(side: str = None, pgnum: int = None, overall_pass: bool = None, limit: int = 50):
-#     """ผลล่าสุดแบบย่อ ใหม่สุดอยู่บน กรองได้ เช่น /results?side=LH&pgnum=20&overall_pass=false"""
-#     return db.get_results(side=side.upper() if side else None, pgnum=pgnum,
-#                           overall_pass=overall_pass, limit=limit)
-
-
-# @app.get("/results/latest")
-# def latest_result(side: str = "LH", pgnum: int = 20):
-#     """ผลเต็มของคันล่าสุด (มี input/recon สำหรับพล็อตกราฟ)"""
-#     r = db.get_latest(side.upper(), pgnum)
-#     if r is None:
-#         raise HTTPException(404, f"ยังไม่มีผลของ {side.upper()} PG{pgnum}")
-#     return r
-
-
-# @app.get("/results/{bn}")
-# def result_by_bn(bn: int, side: str = "LH", pgnum: int = 20):
-#     """ผลเต็มของรถคันที่ระบุ BN"""
-#     r = db.get_by_bn(side.upper(), pgnum, bn)
-#     if r is None:
-#         raise HTTPException(404, f"ไม่พบ BN {bn} ({side.upper()} PG{pgnum})")
-#     return r
