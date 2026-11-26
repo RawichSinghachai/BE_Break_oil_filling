@@ -23,7 +23,7 @@ print("after condition:", df.shape)
 # 4) แทนค่า sentinel (ค่าพุ่งชนเพดาน 10000) ด้วย 0 ในคอลัมน์ vacuum
 #    ค่าปกติต่ำกว่า threshold มาก ส่วน spike = 10000 ไม่ใช่ค่าจริง
 SENTINEL_COLS = ["lh_vacuumpump", "lh_vacuumgun"]
-THRESH = 300
+THRESH = 1200
 for c in SENTINEL_COLS:
     if c in df.columns:
         n = int((df[c] >= THRESH).sum())

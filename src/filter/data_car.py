@@ -22,7 +22,7 @@ from matplotlib.patches import Patch
 INPUT = "data_filtered.csv"   # ไฟล์ที่ได้จาก filter_data.py
 PGNUM = 14                        # <-- เลือก lh_pgnum ที่นี่
 BN    = 27605                     # <-- เลือก lh_bn ที่นี่ (ใส่เลข หรือ None = เลือกอัตโนมัติ)
-YCOL  = "lh_vacuumpump"            # <-- เลือกคอลัมน์ที่จะแสดงบนแกน y
+YCOL  = "lh_vacuumgun"            # <-- เลือกคอลัมน์ที่จะแสดงบนแกน y
 USE_DATETIME = False              # <-- True = ป้ายแกน x เป็น recorded_at ; False = index
 # =================================================
 
