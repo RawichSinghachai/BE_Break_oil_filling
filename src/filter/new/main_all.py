@@ -38,7 +38,7 @@ print("after condition:", df.shape)
 # 5) จำกัดเพดานค่าในคอลัมน์ vacuum: ค่าที่มากกว่า 300 ให้ใส่เป็น 300
 #    (ค่า spike เช่น 2600 / 9999 ถูกตัดเหลือ 300 แทนการเปลี่ยนเป็น 0 เพื่อไม่ให้เส้นดิ่งลงเป็นรูปตัว V)
 CLIP_COLS = ["vacuumpump", "vacuumgun"]
-THRESH = 300
+THRESH = 1200
 for c in CLIP_COLS:
     if c in df.columns:
         n = int((df[c] > THRESH).sum())
